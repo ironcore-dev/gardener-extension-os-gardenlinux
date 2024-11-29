@@ -8,14 +8,17 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"path/filepath"
 
 	"github.com/gardener/gardener/extensions/pkg/controller/operatingsystemconfig"
-	"github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
 	"github.com/go-logr/logr"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/gardener/gardener-extension-os-gardenlinux/pkg/gardenlinux"
 	"github.com/gardener/gardener-extension-os-gardenlinux/pkg/memoryone"
 )
 
@@ -30,15 +33,15 @@ func NewActuator(mgr manager.Manager) operatingsystemconfig.Actuator {
 	}
 }
 
-func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, osc *extensionsv1alpha1.OperatingSystemConfig) ([]byte, []extensionsv1alpha1.Unit, []extensionsv1alpha1.File, *v1alpha1.InPlaceUpdateConfig, error) {
+func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, osc *extensionsv1alpha1.OperatingSystemConfig) ([]byte, []extensionsv1alpha1.Unit, []extensionsv1alpha1.File, *extensionsv1alpha1.InPlaceUpdateConfig, error) {
 	switch purpose := osc.Spec.Purpose; purpose {
 	case extensionsv1alpha1.OperatingSystemConfigPurposeProvision:
 		userData, err := a.handleProvisionOSC(ctx, osc)
 		return []byte(userData), nil, nil, nil, err
 
 	case extensionsv1alpha1.OperatingSystemConfigPurposeReconcile:
-		extensionUnits, extensionFiles, err := a.handleReconcileOSC(osc)
-		return nil, extensionUnits, extensionFiles, nil, err
+		extensionUnits, extensionFiles, inPlaceUpdateConfig, err := a.handleReconcileOSC(osc)
+		return nil, extensionUnits, extensionFiles, inPlaceUpdateConfig, err
 
 	default:
 		return nil, nil, nil, nil, fmt.Errorf("unknown purpose: %s", purpose)
@@ -133,14 +136,85 @@ Content-Type: text/x-shellscript
 	return out, nil
 }
 
-func (a *actuator) handleReconcileOSC(_ *extensionsv1alpha1.OperatingSystemConfig) ([]extensionsv1alpha1.Unit, []extensionsv1alpha1.File, error) {
+var (
+	scriptContentInPlaceUpdate          []byte
+	scriptContentGFunctions             []byte
+	scriptContentKubeletCGroupDriver    []byte
+	scriptContentContainerdCGroupDriver []byte
+)
 
-	// TODO(MrBatschner): remove once https://github.com/gardener/gardener/issues/10809 in GNA has been resolved
-	extensionUnits := []extensionsv1alpha1.Unit{
-		{
-			Name: "containerd.service",
-		},
+func init() {
+	var err error
+
+	scriptContentInPlaceUpdate, err = gardenlinux.Templates.ReadFile(filepath.Join("scripts", "inplace-update.sh"))
+	utilruntime.Must(err)
+	scriptContentGFunctions, err = gardenlinux.Templates.ReadFile(filepath.Join("scripts", "g_functions.sh"))
+	utilruntime.Must(err)
+	scriptContentKubeletCGroupDriver, err = gardenlinux.Templates.ReadFile(filepath.Join("scripts", "kubelet_cgroup_driver.sh"))
+	utilruntime.Must(err)
+	scriptContentContainerdCGroupDriver, err = gardenlinux.Templates.ReadFile(filepath.Join("scripts", "containerd_cgroup_driver.sh"))
+	utilruntime.Must(err)
+}
+
+func (a *actuator) handleReconcileOSC(osConfig *extensionsv1alpha1.OperatingSystemConfig) ([]extensionsv1alpha1.Unit, []extensionsv1alpha1.File, *extensionsv1alpha1.InPlaceUpdateConfig, error) {
+	var (
+		extensionUnits []extensionsv1alpha1.Unit
+		extensionFiles []extensionsv1alpha1.File
+	)
+
+	filePathOSUpdateScript := filepath.Join(gardenlinux.ScriptLocation, "inplace-update.sh")
+	extensionFiles = append(extensionFiles, extensionsv1alpha1.File{
+		Path:        filePathOSUpdateScript,
+		Content:     extensionsv1alpha1.FileContent{Inline: &extensionsv1alpha1.FileContentInline{Data: string(scriptContentInPlaceUpdate)}},
+		Permissions: &gardenlinux.ScriptPermissions,
+	})
+	inPlaceUpdateConfig := &extensionsv1alpha1.InPlaceUpdateConfig{
+		UpdateScriptPath: ptr.To(filePathOSUpdateScript),
+		UpdateScriptArgs: []string{ptr.Deref(osConfig.Spec.OSVersion, "")},
 	}
 
-	return extensionUnits, nil, nil
+	filePathFunctionsHelperScript := filepath.Join(gardenlinux.ScriptLocation, "g_functions.sh")
+	extensionFiles = append(extensionFiles, extensionsv1alpha1.File{
+		Path:        filePathFunctionsHelperScript,
+		Content:     extensionsv1alpha1.FileContent{Inline: &extensionsv1alpha1.FileContentInline{Data: string(scriptContentGFunctions)}},
+		Permissions: &gardenlinux.ScriptPermissions,
+	})
+
+	// add scripts and dropins for kubelet
+	filePathKubeletCGroupDriverScript := filepath.Join(gardenlinux.ScriptLocation, "kubelet_cgroup_driver.sh")
+	extensionFiles = append(extensionFiles, extensionsv1alpha1.File{
+		Path:        filePathKubeletCGroupDriverScript,
+		Content:     extensionsv1alpha1.FileContent{Inline: &extensionsv1alpha1.FileContentInline{Data: string(scriptContentKubeletCGroupDriver)}},
+		Permissions: &gardenlinux.ScriptPermissions,
+	})
+	extensionUnits = append(extensionUnits, extensionsv1alpha1.Unit{
+		Name: "kubelet.service",
+		DropIns: []extensionsv1alpha1.DropIn{{
+			Name: "10-configure-cgroup-driver.conf",
+			Content: `[Service]
+ExecStartPre=` + filePathKubeletCGroupDriverScript + `
+`,
+		}},
+		FilePaths: []string{filePathFunctionsHelperScript, filePathKubeletCGroupDriverScript},
+	})
+
+	// add scripts and dropins for containerd
+	filePathContainerdCGroupDriverScript := filepath.Join(gardenlinux.ScriptLocation, "containerd_cgroup_driver.sh")
+	extensionFiles = append(extensionFiles, extensionsv1alpha1.File{
+		Path:        filePathContainerdCGroupDriverScript,
+		Content:     extensionsv1alpha1.FileContent{Inline: &extensionsv1alpha1.FileContentInline{Data: string(scriptContentContainerdCGroupDriver)}},
+		Permissions: &gardenlinux.ScriptPermissions,
+	})
+	extensionUnits = append(extensionUnits, extensionsv1alpha1.Unit{
+		Name: "containerd.service",
+		DropIns: []extensionsv1alpha1.DropIn{{
+			Name: "10-configure-cgroup-driver.conf",
+			Content: `[Service]
+ExecStartPre=` + filePathContainerdCGroupDriverScript + `
+`,
+		}},
+		FilePaths: []string{filePathFunctionsHelperScript, filePathContainerdCGroupDriverScript},
+	})
+
+	return extensionUnits, extensionFiles, inPlaceUpdateConfig, nil
 }
