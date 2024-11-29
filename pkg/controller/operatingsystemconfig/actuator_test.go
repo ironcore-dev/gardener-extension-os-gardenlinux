@@ -91,7 +91,7 @@ systemctl enable 'some-unit' && systemctl restart --no-block 'some-unit'
 		When("OS type is 'gardenlinux'", func() {
 			Describe("#Reconcile", func() {
 				It("should not return an error", func() {
-					userData, extensionUnits, extensionFiles, err := actuator.Reconcile(ctx, log, osc)
+					userData, extensionUnits, extensionFiles, _, err := actuator.Reconcile(ctx, log, osc)
 					Expect(err).NotTo(HaveOccurred())
 
 					Expect(string(userData)).To(Equal(expectedUserData))
@@ -112,7 +112,7 @@ systemMemory: "6x"`)}
 
 			Describe("#Reconcile", func() {
 				It("should not return an error", func() {
-					userData, extensionUnits, extensionFiles, err := actuator.Reconcile(ctx, log, osc)
+					userData, extensionUnits, extensionFiles, _, err := actuator.Reconcile(ctx, log, osc)
 					Expect(err).NotTo(HaveOccurred())
 
 					Expect(string(userData)).To(Equal(`Content-Type: multipart/mixed; boundary="==BOUNDARY=="
@@ -139,13 +139,13 @@ Content-Type: text/x-shellscript
 
 		Describe("#Reconcile", func() {
 			It("should not return usersdata for purpose reconcile", func() {
-				userData, _, _, err := actuator.Reconcile(ctx, log, osc)
+				userData, _, _, _, err := actuator.Reconcile(ctx, log, osc)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(userData).To(BeEmpty())
 			})
 
 			It("should add one empty additional unit for containerd", func() {
-				_, units, files, err := actuator.Reconcile(ctx, log, osc)
+				_, units, files, _, err := actuator.Reconcile(ctx, log, osc)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(len(units)).To(Equal(1))
 				Expect(units).To(ContainElement(
