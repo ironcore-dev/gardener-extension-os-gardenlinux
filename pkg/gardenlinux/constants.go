@@ -16,6 +16,9 @@ var (
 )
 
 const (
+	// ScriptLocation is the location that Gardener configuration scripts end up on Garden Linux
+	ScriptLocation = "/opt/gardener/bin"
+
 	// OSTypeGardenLinux is a constant for the Garden Linux extension OS type.
 	OSTypeGardenLinux = "gardenlinux"
 )
